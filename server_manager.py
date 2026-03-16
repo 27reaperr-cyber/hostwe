@@ -2,6 +2,8 @@
 server_manager.py
 -----------------
 Handles creation, lifecycle and deletion of Minecraft servers.
+Only Paper is supported. The jar is pre-cached in /opt/paper-cache/paper.jar
+at Docker build time — no downloads happen at runtime.
 Servers are tracked in servers.json.
 """
 
@@ -9,11 +11,9 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import signal
 import subprocess
-import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,7 @@ from utils import get_vps_ip, is_process_alive, logger
 
 SERVERS_DIR = Path("servers")
 SERVERS_JSON = Path("servers.json")
+PAPER_CACHE = Path("/opt/paper-cache")
 SERVERS_DIR.mkdir(exist_ok=True)
 
 # ── JSON persistence ──────────────────────────────────────────────────────────
@@ -73,76 +74,13 @@ def _next_port() -> int:
     return port
 
 
-# ── Download helpers ──────────────────────────────────────────────────────────
-
-def _latest_paper_url() -> str:
-    api = "https://api.papermc.io/v2/projects/paper"
-    with urllib.request.urlopen(api, timeout=15) as r:
-        versions: list[str] = json.loads(r.read())["versions"]
-    latest = versions[-1]
-    builds_api = f"{api}/versions/{latest}/builds"
-    with urllib.request.urlopen(builds_api, timeout=15) as r:
-        builds = json.loads(r.read())["builds"]
-    build_num = builds[-1]["build"]
-    jar_name = f"paper-{latest}-{build_num}.jar"
-    return (
-        f"https://api.papermc.io/v2/projects/paper/versions/{latest}"
-        f"/builds/{build_num}/downloads/{jar_name}"
-    )
-
-
-def _latest_vanilla_url() -> str:
-    manifest = "https://launchermeta.mojang.com/mc/game/version_manifest_v2.json"
-    with urllib.request.urlopen(manifest, timeout=15) as r:
-        data = json.loads(r.read())
-    latest_id = data["latest"]["release"]
-    for v in data["versions"]:
-        if v["id"] == latest_id:
-            with urllib.request.urlopen(v["url"], timeout=15) as r2:
-                meta = json.loads(r2.read())
-            return meta["downloads"]["server"]["url"]
-    raise RuntimeError("Could not find latest vanilla version")
-
-
-def _download(url: str, dest: Path) -> None:
-    logger.info("Downloading %s -> %s", url, dest)
-    urllib.request.urlretrieve(url, dest)
-
-
-# ── BuildTools (Spigot) ───────────────────────────────────────────────────────
-
-def _build_spigot(server_dir: Path) -> Path:
-    bt_url = "https://hub.spigotmc.org/jenkins/job/BuildTools/lastSuccessfulBuild/artifact/target/BuildTools.jar"
-    bt_jar = server_dir / "BuildTools.jar"
-    _download(bt_url, bt_jar)
-    logger.info("Running BuildTools for Spigot (this may take a while)…")
-    result = subprocess.run(
-        ["java", "-jar", str(bt_jar), "--rev", "latest", "--nogui"],
-        cwd=str(server_dir),
-        capture_output=True,
-        text=True,
-        timeout=900,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"BuildTools failed:\n{result.stderr[-1000:]}")
-    # find produced spigot jar
-    for f in server_dir.glob("spigot-*.jar"):
-        return f
-    raise RuntimeError("BuildTools did not produce a spigot jar")
-
-
 # ── Create ────────────────────────────────────────────────────────────────────
 
-def create_server(
-    name: str,
-    server_type: str,
-    progress_callback=None,
-) -> dict[str, Any]:
+def create_server(name: str, progress_callback=None) -> dict[str, Any]:
     """
-    Create and start a new Minecraft server.
-
+    Create and start a new Paper server.
+    Uses the pre-cached jar from /opt/paper-cache/paper.jar (built into image).
     progress_callback(msg: str) is called with status updates if provided.
-    Returns the server dict on success.
     """
     data = _load()
 
@@ -151,49 +89,34 @@ def create_server(
     if len(data) >= config.MAX_SERVERS:
         raise ValueError(f"Maximum number of servers ({config.MAX_SERVERS}) reached")
 
-    server_dir = SERVERS_DIR / name
-    server_dir.mkdir(parents=True, exist_ok=True)
-
     def _progress(msg: str) -> None:
         logger.info(msg)
         if progress_callback:
             progress_callback(msg)
 
-    port = _next_port()
-    jar_path: Path
+    # ── Copy jar from cache ───────────────────────────────────────────────────
+    cached_jar = PAPER_CACHE / "paper.jar"
+    if not cached_jar.exists():
+        raise FileNotFoundError(
+            "Paper jar not found in /opt/paper-cache/paper.jar. "
+            "Rebuild the Docker image."
+        )
 
-    # ── Download / build ──────────────────────────────────────────────────────
-    _progress(f"Preparing {server_type} server…")
+    server_dir = SERVERS_DIR / name
+    server_dir.mkdir(parents=True, exist_ok=True)
+    _progress("Copying Paper jar…")
+    shutil.copy(cached_jar, server_dir / "server.jar")
 
-    if server_type == "paper":
-        _progress("Fetching latest PaperMC version info…")
-        url = _latest_paper_url()
-        jar_path = server_dir / "server.jar"
-        _progress("Downloading Paper jar…")
-        _download(url, jar_path)
-
-    elif server_type == "vanilla":
-        _progress("Fetching latest Vanilla version info…")
-        url = _latest_vanilla_url()
-        jar_path = server_dir / "server.jar"
-        _progress("Downloading Vanilla jar…")
-        _download(url, jar_path)
-
-    elif server_type == "spigot":
-        _progress("Building Spigot via BuildTools (may take ~5 min)…")
-        jar_path = _build_spigot(server_dir)
-        # normalise name for startup
-        canonical = server_dir / "server.jar"
-        shutil.copy(jar_path, canonical)
-        jar_path = canonical
-
-    else:
-        raise ValueError(f"Unknown server type: {server_type}")
+    # Copy pre-warmed Paper cache (contains mojang jar) if present
+    cached_paper_cache = PAPER_CACHE / "cache"
+    if cached_paper_cache.exists():
+        _progress("Restoring cached Mojang jar…")
+        shutil.copytree(cached_paper_cache, server_dir / "cache", dirs_exist_ok=True)
 
     # ── Config files ──────────────────────────────────────────────────────────
+    port = _next_port()
     (server_dir / "eula.txt").write_text("eula=true\n")
-
-    props = (
+    (server_dir / "server.properties").write_text(
         f"server-port={port}\n"
         "gamemode=survival\n"
         "difficulty=normal\n"
@@ -201,7 +124,6 @@ def create_server(
         "online-mode=true\n"
         "motd=A Minecraft Server\n"
     )
-    (server_dir / "server.properties").write_text(props)
 
     # ── Start process ─────────────────────────────────────────────────────────
     _progress("Starting server…")
@@ -212,7 +134,7 @@ def create_server(
             f"-Xms{config.SERVER_RAM_MIN}",
             f"-Xmx{config.SERVER_RAM_MAX}",
             "-jar",
-            jar_path.name,
+            "server.jar",
             "nogui",
         ],
         cwd=str(server_dir),
@@ -228,7 +150,7 @@ def create_server(
         "pid": proc.pid,
         "status": "running",
         "port": port,
-        "type": server_type,
+        "type": "paper",
     }
     data[name] = entry
     _save(data)

@@ -221,38 +221,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             f"{notice}\n\n{text}", reply_markup=markup, parse_mode="HTML"
         )
 
-    # Create — choose type
+    # Create — ask for name directly (only Paper supported)
     elif data == "menu_create":
         servers = sm.list_servers()
         if len(servers) >= config.MAX_SERVERS:
             await query.answer(f"Maximum {config.MAX_SERVERS} servers reached.", show_alert=True)
             return
-        text = "<b>Create Server</b>\n\nChoose server type:"
-        markup = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("Paper", callback_data="create_type_paper")],
-                [InlineKeyboardButton("Vanilla", callback_data="create_type_vanilla")],
-                [InlineKeyboardButton("Spigot", callback_data="create_type_spigot")],
-                [InlineKeyboardButton("Back", callback_data="menu_main")],
-            ]
-        )
-        await _edit(update, text, markup)
-
-    # Create — type selected, ask for name
-    elif data.startswith("create_type_"):
-        server_type = data[len("create_type_"):]
-        await query.answer()
-        context.user_data["pending_type"] = server_type
         text = (
-            f"<b>Create Server</b>\n\n"
-            f"Type: <b>{server_type}</b>\n\n"
+            "<b>Create Server</b>\n\n"
+            "Type: <b>Paper</b> (latest)\n\n"
             "Send the server name (letters, digits, underscores, max 24 chars):"
         )
         markup = InlineKeyboardMarkup(
             [[InlineKeyboardButton("Cancel", callback_data="menu_main")]]
         )
-        await query.edit_message_text(text, reply_markup=markup, parse_mode="HTML")
+        await _edit(update, text, markup)
         context.user_data["awaiting_server_name"] = True
+
+    # (removed: create_type_* handler — only Paper is supported)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -261,7 +247,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     context.user_data["awaiting_server_name"] = False
-    server_type = context.user_data.pop("pending_type", "paper")
     raw_name = (update.message.text or "").strip()
 
     if not re.fullmatch(r"[a-zA-Z0-9_]{1,24}", raw_name):
@@ -273,7 +258,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Acknowledge and start creation
     status_msg = await update.message.reply_text(
-        f"Creating <b>{html.escape(raw_name)}</b> ({server_type})…",
+        f"Creating <b>{html.escape(raw_name)}</b> (Paper)…",
         parse_mode="HTML",
     )
 
@@ -289,7 +274,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
     try:
-        entry = await asyncio.to_thread(sm.create_server, raw_name, server_type, progress)
+        entry = await asyncio.to_thread(sm.create_server, raw_name, progress)
         ip = get_vps_ip()
         final = (
             f"Server <b>{html.escape(raw_name)}</b> created and started.\n\n"
