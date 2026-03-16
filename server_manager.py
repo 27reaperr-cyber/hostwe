@@ -229,13 +229,16 @@ def get_logs(name: str, lines: int = 20) -> str:
     if not srv:
         raise KeyError(f"Server '{name}' not found")
 
-    log_path = Path(srv["path"]) / "server.log"
-    if not log_path.exists():
-        return "(no log file yet)"
+    server_dir = Path(srv["path"])
 
-    with open(log_path) as f:
-        all_lines = f.readlines()
-    return "".join(all_lines[-lines:]) or "(log is empty)"
+    # Paper writes to logs/latest.log, not stdout
+    for candidate in [server_dir / "logs" / "latest.log", server_dir / "server.log"]:
+        if candidate.exists() and candidate.stat().st_size > 0:
+            with open(candidate) as f:
+                all_lines = f.readlines()
+            return "".join(all_lines[-lines:])
+
+    return "(no logs yet — server may still be starting)"
 
 
 # ── Delete ────────────────────────────────────────────────────────────────────
