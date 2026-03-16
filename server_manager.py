@@ -1,16 +1,14 @@
 """
 server_manager.py
 -----------------
-Handles creation, lifecycle and deletion of Minecraft servers.
-Only Paper is supported. The jar is pre-cached in /opt/paper-cache/paper.jar
-at Docker build time — no downloads happen at runtime.
-Servers are tracked in servers.json.
+Paper-only server manager. Jar pre-cached at /opt/paper-cache/ in Docker image.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -20,10 +18,18 @@ from typing import Any
 import config
 from utils import get_vps_ip, is_process_alive, logger
 
-SERVERS_DIR = Path("servers")
+SERVERS_DIR  = Path("servers")
 SERVERS_JSON = Path("servers.json")
-PAPER_CACHE = Path("/opt/paper-cache")
+PAPER_CACHE  = Path("/opt/paper-cache")
+
 SERVERS_DIR.mkdir(exist_ok=True)
+
+# ── ANSI strip ────────────────────────────────────────────────────────────────
+_ANSI = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI.sub("", text)
+
 
 # ── JSON persistence ──────────────────────────────────────────────────────────
 
@@ -31,8 +37,10 @@ def _load() -> dict[str, Any]:
     if not SERVERS_JSON.exists():
         return {}
     with open(SERVERS_JSON) as f:
-        return json.load(f)
-
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return {}
 
 def _save(data: dict[str, Any]) -> None:
     with open(SERVERS_JSON, "w") as f:
@@ -42,7 +50,6 @@ def _save(data: dict[str, Any]) -> None:
 # ── Status helpers ────────────────────────────────────────────────────────────
 
 def refresh_statuses() -> None:
-    """Set status=stopped for any server whose process is no longer alive."""
     data = _load()
     changed = False
     for srv in data.values():
@@ -53,11 +60,9 @@ def refresh_statuses() -> None:
     if changed:
         _save(data)
 
-
 def list_servers() -> list[dict[str, Any]]:
     refresh_statuses()
     return list(_load().values())
-
 
 def get_server(name: str) -> dict[str, Any] | None:
     refresh_statuses()
@@ -74,46 +79,62 @@ def _next_port() -> int:
     return port
 
 
+# ── Launch helper ─────────────────────────────────────────────────────────────
+
+def _launch(server_dir: Path) -> subprocess.Popen:
+    log_file = open(server_dir / "server.log", "a")
+    return subprocess.Popen(
+        [
+            "java",
+            f"-Xms{config.SERVER_RAM_MIN}",
+            f"-Xmx{config.SERVER_RAM_MAX}",
+            "-jar", "server.jar",
+            "nogui",
+        ],
+        cwd=str(server_dir),
+        stdout=log_file,
+        stderr=log_file,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
 # ── Create ────────────────────────────────────────────────────────────────────
 
 def create_server(name: str, progress_callback=None) -> dict[str, Any]:
-    """
-    Create and start a new Paper server.
-    Uses the pre-cached jar from /opt/paper-cache/paper.jar (built into image).
-    progress_callback(msg: str) is called with status updates if provided.
-    """
     data = _load()
 
     if name in data:
         raise ValueError(f"Server '{name}' already exists")
     if len(data) >= config.MAX_SERVERS:
-        raise ValueError(f"Maximum number of servers ({config.MAX_SERVERS}) reached")
+        raise ValueError(f"Maximum {config.MAX_SERVERS} servers reached")
 
-    def _progress(msg: str) -> None:
+    def _p(msg: str) -> None:
         logger.info(msg)
         if progress_callback:
             progress_callback(msg)
 
-    # ── Copy jar from cache ───────────────────────────────────────────────────
+    # Verify cache exists
     cached_jar = PAPER_CACHE / "paper.jar"
     if not cached_jar.exists():
         raise FileNotFoundError(
-            "Paper jar not found in /opt/paper-cache/paper.jar. "
-            "Rebuild the Docker image."
+            "paper.jar not found at /opt/paper-cache/paper.jar — rebuild the Docker image."
         )
 
     server_dir = SERVERS_DIR / name
     server_dir.mkdir(parents=True, exist_ok=True)
-    _progress("Copying Paper jar…")
+
+    # Copy jar
+    _p("Copying Paper jar…")
     shutil.copy(cached_jar, server_dir / "server.jar")
 
-    # Copy pre-warmed Paper cache (contains mojang jar) if present
-    cached_paper_cache = PAPER_CACHE / "cache"
-    if cached_paper_cache.exists():
-        _progress("Restoring cached Mojang jar…")
-        shutil.copytree(cached_paper_cache, server_dir / "cache", dirs_exist_ok=True)
+    # Copy pre-warmed mojang cache if present
+    cached_mc = PAPER_CACHE / "cache"
+    if cached_mc.exists():
+        _p("Restoring Mojang jar cache…")
+        shutil.copytree(str(cached_mc), str(server_dir / "cache"), dirs_exist_ok=True)
 
-    # ── Config files ──────────────────────────────────────────────────────────
+    # Write config
     port = _next_port()
     (server_dir / "eula.txt").write_text("eula=true\n")
     (server_dir / "server.properties").write_text(
@@ -125,37 +146,22 @@ def create_server(name: str, progress_callback=None) -> dict[str, Any]:
         "motd=A Minecraft Server\n"
     )
 
-    # ── Start process ─────────────────────────────────────────────────────────
-    _progress("Starting server…")
-    log_file = open(server_dir / "server.log", "a")
-    proc = subprocess.Popen(
-        [
-            "java",
-            f"-Xms{config.SERVER_RAM_MIN}",
-            f"-Xmx{config.SERVER_RAM_MAX}",
-            "-jar",
-            "server.jar",
-            "nogui",
-        ],
-        cwd=str(server_dir),
-        stdout=log_file,
-        stderr=log_file,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+    # Start
+    _p("Starting server process…")
+    proc = _launch(server_dir)
 
     entry: dict[str, Any] = {
-        "name": name,
-        "path": str(server_dir),
-        "pid": proc.pid,
+        "name":   name,
+        "path":   str(server_dir),
+        "pid":    proc.pid,
         "status": "running",
-        "port": port,
-        "type": "paper",
+        "port":   port,
+        "type":   "paper",
     }
     data[name] = entry
     _save(data)
 
-    _progress(f"Server '{name}' started on {get_vps_ip()}:{port}")
+    _p(f"Done — {get_vps_ip()}:{port}")
     return entry
 
 
@@ -163,35 +169,18 @@ def create_server(name: str, progress_callback=None) -> dict[str, Any]:
 
 def start_server(name: str) -> dict[str, Any]:
     data = _load()
-    srv = data.get(name)
+    srv  = data.get(name)
     if not srv:
         raise KeyError(f"Server '{name}' not found")
     if is_process_alive(srv.get("pid")):
         raise RuntimeError(f"Server '{name}' is already running")
 
     server_dir = Path(srv["path"])
-    jar_path = server_dir / "server.jar"
-    if not jar_path.exists():
-        raise FileNotFoundError(f"server.jar not found in {server_dir}")
+    if not (server_dir / "server.jar").exists():
+        raise FileNotFoundError(f"server.jar missing in {server_dir}")
 
-    log_file = open(server_dir / "server.log", "a")
-    proc = subprocess.Popen(
-        [
-            "java",
-            f"-Xms{config.SERVER_RAM_MIN}",
-            f"-Xmx{config.SERVER_RAM_MAX}",
-            "-jar",
-            "server.jar",
-            "nogui",
-        ],
-        cwd=str(server_dir),
-        stdout=log_file,
-        stderr=log_file,
-        stdin=subprocess.DEVNULL,
-        start_new_session=True,
-    )
-
-    srv["pid"] = proc.pid
+    proc = _launch(server_dir)
+    srv["pid"]    = proc.pid
     srv["status"] = "running"
     _save(data)
     return srv
@@ -199,7 +188,7 @@ def start_server(name: str) -> dict[str, Any]:
 
 def stop_server(name: str) -> dict[str, Any]:
     data = _load()
-    srv = data.get(name)
+    srv  = data.get(name)
     if not srv:
         raise KeyError(f"Server '{name}' not found")
 
@@ -207,10 +196,10 @@ def stop_server(name: str) -> dict[str, Any]:
     if pid and is_process_alive(pid):
         try:
             os.killpg(os.getpgid(pid), signal.SIGTERM)
-        except ProcessLookupError:
+        except (ProcessLookupError, OSError):
             pass
 
-    srv["pid"] = None
+    srv["pid"]    = None
     srv["status"] = "stopped"
     _save(data)
     return srv
@@ -225,27 +214,33 @@ def restart_server(name: str) -> dict[str, Any]:
 
 def get_logs(name: str, lines: int = 20) -> str:
     data = _load()
-    srv = data.get(name)
+    srv  = data.get(name)
     if not srv:
         raise KeyError(f"Server '{name}' not found")
 
     server_dir = Path(srv["path"])
 
-    # Paper writes to logs/latest.log, not stdout
-    for candidate in [server_dir / "logs" / "latest.log", server_dir / "server.log"]:
-        if candidate.exists() and candidate.stat().st_size > 0:
-            with open(candidate) as f:
-                all_lines = f.readlines()
-            return "".join(all_lines[-lines:])
+    # Paper writes to logs/latest.log — prefer that, fallback to server.log (our stdout redirect)
+    candidates = [
+        server_dir / "logs" / "latest.log",
+        server_dir / "server.log",
+    ]
 
-    return "(no logs yet — server may still be starting)"
+    for path in candidates:
+        if path.exists() and path.stat().st_size > 0:
+            with open(path, errors="replace") as f:
+                all_lines = f.readlines()
+            tail = "".join(all_lines[-lines:])
+            return _strip_ansi(tail).strip() or "(log exists but is empty)"
+
+    return "(no logs yet — server may still be initialising)"
 
 
 # ── Delete ────────────────────────────────────────────────────────────────────
 
 def delete_server(name: str) -> None:
     data = _load()
-    srv = data.get(name)
+    srv  = data.get(name)
     if not srv:
         raise KeyError(f"Server '{name}' not found")
 
@@ -253,7 +248,7 @@ def delete_server(name: str) -> None:
     if pid and is_process_alive(pid):
         try:
             os.killpg(os.getpgid(pid), signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, OSError):
             pass
 
     server_dir = Path(srv["path"])
