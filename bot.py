@@ -278,14 +278,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
     steps: list[str] = []
+    loop = asyncio.get_event_loop()
 
     def progress(msg: str) -> None:
         steps.append(msg)
-        asyncio.create_task(
-            status_msg.edit_text(
-                f"<b>Creating server…</b>\n\n" + "\n".join(html.escape(s) for s in steps),
-                parse_mode="HTML",
-            )
+        text = "<b>Creating server…</b>\n\n" + "\n".join(html.escape(s) for s in steps)
+        asyncio.run_coroutine_threadsafe(
+            status_msg.edit_text(text, parse_mode="HTML"),
+            loop,
         )
 
     try:
